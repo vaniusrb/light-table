@@ -1,0 +1,28 @@
+[package]
+name = "rsraw-sys"
+version = "0.1.1"
+build = "build.rs"
+include = ["src/lib.rs", "src/bindings.rs", "LICENSE-*", "README.md", "LibRaw/libraw/*", "LibRaw/src/*", "LibRaw/internal/*", "LibRaw/COPYRIGHT", "LibRaw/LICENSE.*", "build.rs"]
+edition = "2021"
+authors = ["hexilee <i@hexilee.me>"]
+description = "Low-level FFI bindings for the LibRaw C++ library"
+license = "MIT"
+repository = "https://github.com/hexilee/rsraw"
+homepage = "https://github.com/hexilee/rsraw"
+documentation = "https://docs.rs/rsraw-sys"
+keywords = ["raw", "image", "libraw", "ffi", "bindings"]
+categories = ["multimedia::images", "external-ffi-bindings"]
+readme = "../README.md"
+
+[dependencies]
+libc = "0.2"
+
+[features]
+default = []
+
+[lib]
+name = "rsraw_sys"
+
+[build-dependencies]
+cc = { version = "1.2", features = ["parallel"] }
+bindgen = { version = "0.71", default-features = false, features = ["runtime"] }

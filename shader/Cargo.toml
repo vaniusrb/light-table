@@ -1,0 +1,12 @@
+[package]
+name = "shader"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+spirv-std = { git = "https://github.com/Rust-GPU/rust-gpu", rev = "e7e447a9395a77caec5cbddea556af86bc68c573" }
+# Pin glam <0.33 for spirv-std (0.33+ needs integer-types; spirv-std only enables libm)
+glam = { version = "=0.31.0", default-features = false, features = ["libm"] }

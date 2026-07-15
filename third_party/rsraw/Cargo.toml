@@ -1,0 +1,3 @@
+﻿[workspace]
+members = ["rsraw", "rsraw-sys"]
+resolver = "2"

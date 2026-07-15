@@ -1,0 +1,49 @@
+[workspace]
+members = ["shader"]
+resolver = "2"
+
+[package]
+name = "light-table"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = { version = "0.19", features = ["spirv"] }
+winit = "0.29"
+egui = "0.27"
+egui-wgpu = "0.27"
+egui-winit = "0.27"
+bytemuck = { version = "1.14", features = ["derive"] }
+pollster = "0.3"
+glam = "0.29"
+env_logger = "0.11"
+log = "0.4"
+rfd = "0.14"
+image = "0.25"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+half = "2.4"
+
+# RAW (CR2/CR3/…) via vendored rsraw (LibRaw). On Windows needs:
+#   - LLVM libclang: set LIBCLANG_PATH=C:\Program Files\LLVM\bin
+#   - MSVC C++ toolchain (or Clang)
+#   cargo run --features raw
+[features]
+default = ["raw"]
+raw = ["dep:rsraw"]
+
+# Vendored fork of Hexilee/rsraw with Windows static LibRaw (LIBRAW_NODLL) support.
+[dependencies.rsraw]
+path = "third_party/rsraw/rsraw"
+optional = true
+
+[build-dependencies]
+# rust-gpu must match rust-toolchain.toml (nightly-2025-06-30); pin rev so main cannot drift.
+spirv-builder = { git = "https://github.com/Rust-GPU/rust-gpu", rev = "e7e447a9395a77caec5cbddea556af86bc68c573" }
+
+# Speed up spirv-builder compilation (it compiles the rustc codegen backend)
+[profile.release.build-override]
+opt-level = 3
+codegen-units = 16
+[profile.dev.build-override]
+opt-level = 3

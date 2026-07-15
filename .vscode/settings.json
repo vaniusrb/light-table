@@ -1,0 +1,31 @@
+{
+    "workbench.colorCustomizations": {
+        "[Monokai Pro (Filter Spectrum)]": {
+            "editorInlayHint.foreground": "#c9d7d8a2",
+            "editorInlayHint.background": "#ffffff00",
+            "editorInlayHint.typeForeground": "#c9d7d8a2",
+            "editorInlayHint.typeBackground": "#ffffff00",
+            "editorInlayHint.parameterForeground": "#c9d7d8a2",
+            "editorInlayHint.parameterBackground": "#ffffff00"
+        },
+        "[Default Light Modern]": {
+            "editorInlayHint.foreground": "#9cacade8",
+            "editorInlayHint.background": "#e4e4e40e",
+            "editorInlayHint.typeForeground": "#9cacade8",
+            "editorInlayHint.typeBackground": "#e4e4e40e",
+            "editorInlayHint.parameterForeground": "#9cacade8",
+            "editorInlayHint.parameterBackground": "#e4e4e40e"
+        },
+        "activityBar.background": "#4C0A64",
+        "titleBar.activeBackground": "#6A0E8C",
+        "titleBar.activeForeground": "#FDFAFE",
+        "titleBar.inactiveBackground": "#4C0A64",
+        "titleBar.inactiveForeground": "#FDFAFE",
+        "statusBar.background": "#4C0A64",
+        "statusBar.foreground": "#FDFAFE",
+        "statusBar.debuggingBackground": "#4C0A64",
+        "statusBar.debuggingForeground": "#FDFAFE",
+        "statusBar.noFolderBackground": "#4C0A64",
+        "statusBar.noFolderForeground": "#FDFAFE"
+    }
+}
