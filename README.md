@@ -96,7 +96,7 @@ Opening a RAW does **not** block on full demosaic:
 | Action | How |
 |---|---|
 | Open | **Open…** or `O` |
-| Export | **Export…** — PNG/JPEG with develop + crop + rotate |
+| Export | **Export…** — defaults to **JPEG** (PNG optional); develop + crop + rotate |
 | Pan | Drag on the image (disabled in crop-edit) |
 | Zoom | Mouse wheel (crop is the viewport; zoom-out does not show uncropped pixels) |
 | Fit | **Fit** or `F` |
@@ -217,11 +217,60 @@ More detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Notes & limits
 
+### Engineering
+
 - **GPU shaders are pure Rust** (rust-gpu); only optional RAW decode pulls in C++ (LibRaw)
-- **Color management:** linear process + approximate sRGB display (no ICC / Display P3 yet)
-- **Histogram** ignores full denoise/spatial filters (center-sample style grid)
-- **Export** re-applies develop on CPU and rasterizes crop/rotate; full-res RAW demosaic can take a while
+- **sRGB transfer** uses the IEC piecewise curve (`powf`) on GPU present + histogram and on CPU export; load uses the matching inverse
 - **Vulkan validation** is off unless `WGPU_VALIDATION` is set (avoids missing-layer spam)
+- **Export** re-applies develop on the CPU and rasterizes crop/rotate; full-res RAW demosaic can take a while
+
+### Model limits (not full Lightroom)
+
+These are intentional simplifications of the imaging model, not temporary UI gaps:
+
+| Area | Current behavior | Limitation |
+|---|---|---|
+| **Color management** | Work in linear RGB; display/export via approximate **sRGB** | No ICC profiles, no Display P3 / Adobe RGB, no calibrated monitor path |
+| **RAW decode** | LibRaw process → treat RGB as **sRGB-ish** then convert to linear | Real camera data has camera matrices, different encodings, and scene-referred nuance; not a full raw pipeline |
+| **Develop ops** | Parametric exposure, contrast, shadows/highlights, WB gains, vibrance/sat | Simple curves/gains — not Lightroom’s full tone curve, HSL, calibration, or profile-based rendering |
+| **Denoise / sharpen** | 5×5 bilateral NR + unsharp mask in linear light | Local only; no multi-scale NR, no masking maps, no detail vs smoothing split like LR |
+| **Crop / rotate** | Non-destructive UV crop, straighten, 90°, flips | No perspective / keystone, no guided upright, no soft-proof crop for print |
+| **Histogram** | 256² sample grid + tone; bins in display sRGB | Does not fully mirror crop/rotate/spatial filters; not a pixel-perfect full-frame hist |
+| **Working format** | GPU `Rgba16Float` after open | Good for interactive preview; not a 32-bit or camera-raw working space for print-critical work |
+| **Catalog / library** | Single-image session | No filmstrip database, ratings, sync, or batch |
+
+### Possible improvements
+
+Rough priority ideas for later work (not a commitment):
+
+1. **Color**
+   - Shared CPU/GPU color helpers so encode/decode cannot drift
+   - Optional working space + ICC-aware export / soft proof
+   - Better RAW path (camera WB multipliers, matrix, optional scene-linear before tone)
+
+2. **Develop**
+   - Editable tone curve, HSL / color mixer, clarity / dehaze
+   - Graduated / radial / brush masks (extra GPU passes)
+   - Lens corrections (distortion, vignetting, CA) if metadata allows
+
+3. **Detail**
+   - Multi-pass / dual-res denoise; luminance vs color detail controls
+   - Output sharpening vs capture sharpening
+   - Histogram that applies the same crop/rotate/viewport as the canvas
+
+4. **Geometry & UX**
+   - Perspective transform; straighten via drag on a guide line
+   - Dual-res preview (fast proxy always; full-res when zoomed 1:1)
+   - Async full-res refine after half-size RAW open
+
+5. **Library & export**
+   - Sidecar develop settings (JSON / XMP-like)
+   - Batch export, quality presets, embedded color profile in JPEG
+   - Simple on-disk catalog / filmstrip
+
+6. **Platform**
+   - Broader backends (or documented DX12/Metal path) if Vulkan-only is a problem
+   - Optional WGSL fallback for machines without rust-gpu toolchain
 
 ---
 

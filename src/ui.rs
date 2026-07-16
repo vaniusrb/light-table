@@ -515,20 +515,31 @@ fn draw_histogram(ui: &mut egui::Ui, bins: &[u32; 1024]) {
 
     for (offset, color) in channels {
         let channel = &bins[offset..offset + n_bins];
+        // Scale by peak, but ignore a lone spike in bin 0 (pure black / letterbox)
+        // so the rest of the curve is not flattened to the bottom.
         let mut max = 1u32;
-        for &c in channel {
+        for (i, &c) in channel.iter().enumerate() {
+            if i == 0 && c > 0 {
+                // still allow pure-black mass, but prefer interior peak for scaling
+                continue;
+            }
             max = max.max(c);
+        }
+        // If almost everything is black, fall back to true max
+        let true_max = channel.iter().copied().max().unwrap_or(1).max(1);
+        if max <= 1 {
+            max = true_max;
         }
         let mut second = 1u32;
         for &c in channel {
-            if c < max {
+            if c < true_max {
                 second = second.max(c);
             }
         }
-        let scale = if max > second.saturating_mul(8).max(1) {
-            (second as f32 * 1.25).max(1.0)
+        let scale = if true_max > second.saturating_mul(12).max(1) {
+            (second as f32 * 1.35).max(1.0)
         } else {
-            max as f32
+            max.max(second).max(1) as f32
         };
 
         for (i, &count) in channel.iter().enumerate() {

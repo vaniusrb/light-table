@@ -81,47 +81,31 @@ pub struct DevelopGpuParams {
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn powf_approx(x: f32, e: f32) -> f32 {
-    // Cheap positive-base power via exp/log not available in no_std GPU subset
-    // reliably; use polynomial/piecewise only where needed.
-    // For sRGB we use the standard piecewise curve without general pow.
-    let _ = e;
-    x
+fn f32_powf(x: f32, e: f32) -> f32 {
+    use spirv_std::num_traits::Float;
+    x.powf(e)
 }
 
+/// IEC 61966-2-1 sRGB transfer (linear → non-linear). Continuous at the break.
+/// The old sqrt-blend approx jumped at 0.0031308 (≈0.040 vs ≈0.067), which
+/// starved histogram bins around ~8–17 and looked like a “dip” near index 8.
 #[inline]
 fn linear_to_srgb_channel(c: f32) -> f32 {
-    let c = if c < 0.0 {
-        0.0
-    } else if c > 1.0 {
-        1.0
-    } else {
-        c
-    };
+    let c = f32_clamp(c, 0.0, 1.0);
     if c <= 0.0031308 {
         12.92 * c
     } else {
-        // 1.055 * c^(1/2.4) - 0.055 — approximate gamma with sqrt cascade
-        // c^0.4167 ≈ good enough via two sqrts-ish; use Newton's method free form:
-        srgb_encode_approx(c)
+        1.055 * f32_powf(c, 1.0 / 2.4) - 0.055
     }
 }
 
-/// Approximate c^(1/2.4) for display transform (visually close enough for preview).
+/// Map display-referred [0,1] → histogram bin 0..255 without truncating mid-bin mass.
 #[inline]
-fn srgb_encode_approx(c: f32) -> f32 {
-    // Use c^0.5 * mix toward c^0.25 for ~0.4167 exponent.
-    let s = f32_sqrt(c);
-    let q = f32_sqrt(s);
-    // 0.4167 ≈ 2/3 * 0.5 + 1/3 * 0.25 → blend sqrt and quarter
-    let p = s * 0.6666667 + q * 0.3333333;
-    1.055 * p - 0.055
-}
-
-#[inline]
-fn f32_sqrt(x: f32) -> f32 {
-    use spirv_std::num_traits::Float;
-    x.sqrt()
+fn display_to_bin(c: f32) -> u32 {
+    let c = f32_clamp(c, 0.0, 1.0);
+    // floor(c * 255.999) keeps c=1.0 in bin 255 and avoids trunc bias toward lower bins
+    let b = c * 255.999;
+    f32_min(b, 255.0) as u32
 }
 
 #[inline]
@@ -630,10 +614,6 @@ pub fn fs_present(
     }
 
     *output = vec4(r, g, b, 1.0);
-
-    // silence unused warning if any helper retained
-    let _ = powf_approx(1.0, 1.0);
-    let _ = f32_abs(0.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -665,16 +645,16 @@ pub fn hist_cs(
     let sample: Vec4 = source.sample_by_lod(*sampler, uv, 0.0);
     let rgb = develop_pixel(vec3(sample.x, sample.y, sample.z), params);
 
-    // Map to display-ish 0..1 for bins
-    let r = f32_clamp(linear_to_srgb_channel(rgb.x), 0.0, 1.0);
-    let g = f32_clamp(linear_to_srgb_channel(rgb.y), 0.0, 1.0);
-    let b = f32_clamp(linear_to_srgb_channel(rgb.z), 0.0, 1.0);
-    let l = f32_clamp(linear_to_srgb_channel(luminance(rgb)), 0.0, 1.0);
+    // Display-referred sRGB (true curve) → bins 0..255
+    let r = linear_to_srgb_channel(rgb.x);
+    let g = linear_to_srgb_channel(rgb.y);
+    let b = linear_to_srgb_channel(rgb.z);
+    let l = linear_to_srgb_channel(luminance(rgb));
 
-    let ri = f32_min(r * 255.0, 255.0) as u32;
-    let gi = f32_min(g * 255.0, 255.0) as u32;
-    let bi = f32_min(b * 255.0, 255.0) as u32;
-    let li = f32_min(l * 255.0, 255.0) as u32;
+    let ri = display_to_bin(r);
+    let gi = display_to_bin(g);
+    let bi = display_to_bin(b);
+    let li = display_to_bin(l);
 
     // bins: [0..256)=R, [256..512)=G, [512..768)=B, [768..1024)=Luma
     // Scope Device = 5, Semantics None = 0

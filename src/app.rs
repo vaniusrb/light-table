@@ -536,9 +536,9 @@ impl App {
         }
 
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("PNG", &["png"])
             .add_filter("JPEG", &["jpg", "jpeg"])
-            .set_file_name("export.png")
+            .add_filter("PNG", &["png"])
+            .set_file_name("export.jpg")
             .save_file()
         {
             // Prefer full-res re-decode from original RAW path when we only have a proxy
