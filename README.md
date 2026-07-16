@@ -231,7 +231,7 @@ These are intentional simplifications of the imaging model, not temporary UI gap
 | Area | Current behavior | Limitation |
 |---|---|---|
 | **Color management** | Work in linear RGB; display/export via approximate **sRGB** | No ICC profiles, no Display P3 / Adobe RGB, no calibrated monitor path |
-| **RAW decode** | LibRaw process → treat RGB as **sRGB-ish** then convert to linear | Real camera data has camera matrices, different encodings, and scene-referred nuance; not a full raw pipeline |
+| **RAW decode** | LibRaw process → treat RGB as **sRGB-ish** then convert to linear | Mostly **our** thin use of LibRaw (not a hard LibRaw ceiling). Plan to improve: [`docs/RAW_LINEAR_PIPELINE_PLAN.md`](docs/RAW_LINEAR_PIPELINE_PLAN.md) |
 | **Develop ops** | Parametric exposure, contrast, shadows/highlights, WB gains, vibrance/sat | Simple curves/gains — not Lightroom’s full tone curve, HSL, calibration, or profile-based rendering |
 | **Denoise / sharpen** | 5×5 bilateral NR + unsharp mask in linear light | Local only; no multi-scale NR, no masking maps, no detail vs smoothing split like LR |
 | **Crop / rotate** | Non-destructive UV crop, straighten, 90°, flips | No perspective / keystone, no guided upright, no soft-proof crop for print |
