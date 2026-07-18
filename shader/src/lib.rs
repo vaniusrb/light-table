@@ -3,6 +3,7 @@
 //! Entry points:
 //!   - `vs_present` / `fs_present` — pan/zoom canvas with parametric develop
 //!   - `hist_cs` — RGB/luma histogram bins (atomics)
+//!   - `vs_demosaic` / `fs_demosaic` — Bayer mosaic → linear sRGB (half 2×2 or full bilinear)
 
 #![no_std]
 
@@ -620,7 +621,10 @@ pub fn fs_present(
 // Histogram compute (256 bins × 4 channels: R, G, B, Luma)
 // ---------------------------------------------------------------------------
 
-/// Sample a 256×256 UV grid of the source (with develop applied) into histogram bins.
+/// Sample a 256×256 grid over the **crop** (display space), apply the same
+/// rotate/orient/flip as the canvas, then develop + IEC sRGB → bins.
+///
+/// Spatial denoise/sharpen are skipped (too heavy for hist); tone/WB/EV match the view.
 /// Host dispatches `(32, 32, 1)` workgroups of size 8×8.
 #[spirv(compute(threads(8, 8, 1)))]
 pub fn hist_cs(
@@ -637,12 +641,25 @@ pub fn hist_cs(
         return;
     }
 
-    let uv = vec2(
-        (x as f32 + 0.5) / SIZE as f32,
-        (y as f32 + 0.5) / SIZE as f32,
+    // Uniform grid inside the crop rectangle (display / oriented UV)
+    let cl = params.crop_left;
+    let ct = params.crop_top;
+    let cw = f32_max(params.crop_right - params.crop_left, 1e-6);
+    let ch = f32_max(params.crop_bottom - params.crop_top, 1e-6);
+    let display_uv = vec2(
+        cl + (x as f32 + 0.5) / SIZE as f32 * cw,
+        ct + (y as f32 + 0.5) / SIZE as f32 * ch,
     );
+
+    // Same geometry as canvas sampling
+    let uv = display_to_source_uv(display_uv, params);
+    if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 {
+        return;
+    }
+
     // Explicit LOD required in compute (implicit LOD is fragment-only)
     let sample: Vec4 = source.sample_by_lod(*sampler, uv, 0.0);
+    // Tone/WB path only (matches EV / contrast on canvas; skips NR/sharpen)
     let rgb = develop_pixel(vec3(sample.x, sample.y, sample.z), params);
 
     // Display-referred sRGB (true curve) → bins 0..255
@@ -664,4 +681,328 @@ pub fn hist_cs(
         spirv_std::arch::atomic_i_add::<u32, 5, 0>(&mut bins[512 + bi as usize], 1u32);
         spirv_std::arch::atomic_i_add::<u32, 5, 0>(&mut bins[768 + li as usize], 1u32);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4b/4c: Bayer mosaic demosaic → linear sRGB
+//   mode 0 = half 2×2 bin
+//   mode 1 = full-res bilinear
+// ---------------------------------------------------------------------------
+
+/// Must match CPU `demosaic::DemosaicGpuParams` (flat fields — SPIR-V UBO layout).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct DemosaicGpuParams {
+    pub black: f32,
+    pub inv_range: f32,
+    pub filters: u32,
+    pub mode: u32,
+    pub cam_mul_r: f32,
+    pub cam_mul_g: f32,
+    pub cam_mul_b: f32,
+    pub cam_mul_g2: f32,
+    pub m00: f32,
+    pub m01: f32,
+    pub m02: f32,
+    pub _pad0: f32,
+    pub m10: f32,
+    pub m11: f32,
+    pub m12: f32,
+    pub _pad1: f32,
+    pub m20: f32,
+    pub m21: f32,
+    pub m22: f32,
+    pub _pad2: f32,
+    pub mosaic_w: f32,
+    pub mosaic_h: f32,
+    pub out_w: f32,
+    pub out_h: f32,
+}
+
+/// LibRaw FC(row,col) — 0=R, 1=G, 2=B, 3=G2.
+#[inline]
+fn cfa_color(filters: u32, row: u32, col: u32) -> u32 {
+    (filters >> ((((row << 1) & 14) + (col & 1)) << 1)) & 3
+}
+
+#[inline]
+fn sample_mosaic_raw(
+    mosaic: &Image2d,
+    sampler: &Sampler,
+    col: i32,
+    row: i32,
+    mw: f32,
+    mh: f32,
+) -> f32 {
+    // Clamp to active area
+    let mw_i = mw as i32;
+    let mh_i = mh as i32;
+    let c = if col < 0 {
+        0
+    } else if col >= mw_i {
+        mw_i - 1
+    } else {
+        col
+    };
+    let r = if row < 0 {
+        0
+    } else if row >= mh_i {
+        mh_i - 1
+    } else {
+        row
+    };
+    let u = (c as f32 + 0.5) / mw;
+    let v = (r as f32 + 0.5) / mh;
+    let s: Vec4 = mosaic.sample(*sampler, vec2(u, v));
+    s.x
+}
+
+#[inline]
+fn lin_sample(
+    mosaic: &Image2d,
+    sampler: &Sampler,
+    col: i32,
+    row: i32,
+    mw: f32,
+    mh: f32,
+    black: f32,
+    inv_range: f32,
+) -> f32 {
+    let raw = sample_mosaic_raw(mosaic, sampler, col, row, mw, mh);
+    f32_max((raw - black) * inv_range, 0.0)
+}
+
+/// Classic bilinear R,G,B at mosaic site (col, row).
+#[inline]
+fn bilinear_rgb(
+    mosaic: &Image2d,
+    sampler: &Sampler,
+    col: u32,
+    row: u32,
+    mw: f32,
+    mh: f32,
+    filters: u32,
+    black: f32,
+    inv_range: f32,
+) -> Vec3 {
+    let x = col as i32;
+    let y = row as i32;
+    let c = cfa_color(filters, row, col);
+    let v = lin_sample(mosaic, sampler, x, y, mw, mh, black, inv_range);
+
+    // Green
+    let g = if c == 1 || c == 3 {
+        v
+    } else {
+        let n = lin_sample(mosaic, sampler, x, y - 1, mw, mh, black, inv_range);
+        let s = lin_sample(mosaic, sampler, x, y + 1, mw, mh, black, inv_range);
+        let e = lin_sample(mosaic, sampler, x + 1, y, mw, mh, black, inv_range);
+        let w = lin_sample(mosaic, sampler, x - 1, y, mw, mh, black, inv_range);
+        (n + s + e + w) * 0.25
+    };
+
+    // Red
+    let r = if c == 0 {
+        v
+    } else if c == 2 {
+        let nw = lin_sample(mosaic, sampler, x - 1, y - 1, mw, mh, black, inv_range);
+        let ne = lin_sample(mosaic, sampler, x + 1, y - 1, mw, mh, black, inv_range);
+        let sw = lin_sample(mosaic, sampler, x - 1, y + 1, mw, mh, black, inv_range);
+        let se = lin_sample(mosaic, sampler, x + 1, y + 1, mw, mh, black, inv_range);
+        (nw + ne + sw + se) * 0.25
+    } else {
+        let right = cfa_color(filters, row, col.wrapping_add(1));
+        let left = cfa_color(filters, row, col.wrapping_sub(1));
+        if right == 0 || left == 0 {
+            let e = lin_sample(mosaic, sampler, x + 1, y, mw, mh, black, inv_range);
+            let w = lin_sample(mosaic, sampler, x - 1, y, mw, mh, black, inv_range);
+            (e + w) * 0.5
+        } else {
+            let n = lin_sample(mosaic, sampler, x, y - 1, mw, mh, black, inv_range);
+            let s = lin_sample(mosaic, sampler, x, y + 1, mw, mh, black, inv_range);
+            (n + s) * 0.5
+        }
+    };
+
+    // Blue
+    let b = if c == 2 {
+        v
+    } else if c == 0 {
+        let nw = lin_sample(mosaic, sampler, x - 1, y - 1, mw, mh, black, inv_range);
+        let ne = lin_sample(mosaic, sampler, x + 1, y - 1, mw, mh, black, inv_range);
+        let sw = lin_sample(mosaic, sampler, x - 1, y + 1, mw, mh, black, inv_range);
+        let se = lin_sample(mosaic, sampler, x + 1, y + 1, mw, mh, black, inv_range);
+        (nw + ne + sw + se) * 0.25
+    } else {
+        let right = cfa_color(filters, row, col.wrapping_add(1));
+        let left = cfa_color(filters, row, col.wrapping_sub(1));
+        if right == 2 || left == 2 {
+            let e = lin_sample(mosaic, sampler, x + 1, y, mw, mh, black, inv_range);
+            let w = lin_sample(mosaic, sampler, x - 1, y, mw, mh, black, inv_range);
+            (e + w) * 0.5
+        } else {
+            let n = lin_sample(mosaic, sampler, x, y - 1, mw, mh, black, inv_range);
+            let s = lin_sample(mosaic, sampler, x, y + 1, mw, mh, black, inv_range);
+            (n + s) * 0.5
+        }
+    };
+
+    vec3(r, g, b)
+}
+
+/// Soften WB multipliers near sensor clip (must match CPU `soft_wb_mul`).
+/// Full cam_mul on saturated CFA sites → R/B >> G → magenta whites.
+#[inline]
+fn soft_wb_mul(v: f32, mul: f32) -> f32 {
+    const T0: f32 = 0.82;
+    if v <= T0 {
+        mul
+    } else {
+        let t = f32_clamp((v - T0) / (1.0 - T0), 0.0, 1.0);
+        let t = t * t * (3.0 - 2.0 * t);
+        mul + (1.0 - mul) * t
+    }
+}
+
+/// White balance + highlight recovery before rgb_cam (CPU twin in demosaic.rs).
+#[inline]
+fn wb_with_highlight_recovery(rgb: Vec3, p: &DemosaicGpuParams) -> Vec3 {
+    let r0 = f32_max(rgb.x, 0.0);
+    let g0 = f32_max(rgb.y, 0.0);
+    let b0 = f32_max(rgb.z, 0.0);
+
+    let mut r1 = r0 * soft_wb_mul(r0, p.cam_mul_r);
+    let mut g1 = g0 * soft_wb_mul(g0, p.cam_mul_g);
+    let mut b1 = b0 * soft_wb_mul(b0, p.cam_mul_b);
+
+    const T0: f32 = 0.82;
+    let pre_max = f32_max(r0, f32_max(g0, b0));
+    if pre_max > T0 {
+        let t = f32_clamp((pre_max - T0) / (1.0 - T0), 0.0, 1.0);
+        let t = t * t * (3.0 - 2.0 * t);
+        let hi = f32_max(r1, f32_max(g1, b1));
+        r1 = r1 + (hi - r1) * t;
+        g1 = g1 + (hi - g1) * t;
+        b1 = b1 + (hi - b1) * t;
+    }
+
+    vec3(r1, g1, b1)
+}
+
+#[spirv(vertex)]
+pub fn vs_demosaic(
+    #[spirv(vertex_index)] vertex_id: i32,
+    #[spirv(position)] out_pos: &mut Vec4,
+    out_uv: &mut Vec2,
+) {
+    let x = ((vertex_id & 1) * 4 - 1) as f32;
+    let y = ((vertex_id & 2) * 2 - 1) as f32;
+    *out_pos = vec4(x, y, 0.0, 1.0);
+    // Match present: y flip so UV 0 is top
+    *out_uv = vec2(x * 0.5 + 0.5, 1.0 - (y * 0.5 + 0.5));
+}
+
+#[spirv(fragment)]
+pub fn fs_demosaic(
+    in_uv: Vec2,
+    #[spirv(descriptor_set = 0, binding = 0)] mosaic: &Image2d,
+    #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
+    #[spirv(uniform, descriptor_set = 0, binding = 2)] p: &DemosaicGpuParams,
+    output: &mut Vec4,
+) {
+    let ow = if p.out_w > 0.5 { p.out_w } else { 1.0 };
+    let oh = if p.out_h > 0.5 { p.out_h } else { 1.0 };
+    let mw = if p.mosaic_w > 0.5 { p.mosaic_w } else { 1.0 };
+    let mh = if p.mosaic_h > 0.5 { p.mosaic_h } else { 1.0 };
+
+    let ox = f32_min(f32_max(in_uv.x * ow, 0.0), ow - 1.0) as u32;
+    let oy = f32_min(f32_max(in_uv.y * oh, 0.0), oh - 1.0) as u32;
+
+    let rgb = if p.mode == 1 {
+        // Phase 4c: full-res bilinear at 1:1 mosaic sites
+        bilinear_rgb(
+            mosaic,
+            sampler,
+            ox,
+            oy,
+            mw,
+            mh,
+            p.filters,
+            p.black,
+            p.inv_range,
+        )
+    } else {
+        // Phase 4b: half-size 2×2 bin
+        let row0 = oy * 2;
+        let col0 = ox * 2;
+        let mut sum_r = 0.0f32;
+        let mut sum_g = 0.0f32;
+        let mut sum_b = 0.0f32;
+        let mut n_r = 0u32;
+        let mut n_g = 0u32;
+        let mut n_b = 0u32;
+
+        let mut dy = 0u32;
+        while dy < 2 {
+            let mut dx = 0u32;
+            while dx < 2 {
+                let row = row0 + dy;
+                let col = col0 + dx;
+                if (row as f32) < mh && (col as f32) < mw {
+                    let v = lin_sample(
+                        mosaic,
+                        sampler,
+                        col as i32,
+                        row as i32,
+                        mw,
+                        mh,
+                        p.black,
+                        p.inv_range,
+                    );
+                    let c = cfa_color(p.filters, row, col);
+                    if c == 0 {
+                        sum_r += v;
+                        n_r += 1;
+                    } else if c == 2 {
+                        sum_b += v;
+                        n_b += 1;
+                    } else {
+                        sum_g += v;
+                        n_g += 1;
+                    }
+                }
+                dx += 1;
+            }
+            dy += 1;
+        }
+
+        let r = if n_r > 0 {
+            sum_r / n_r as f32
+        } else {
+            0.0
+        };
+        let g = if n_g > 0 {
+            sum_g / n_g as f32
+        } else {
+            0.0
+        };
+        let b = if n_b > 0 {
+            sum_b / n_b as f32
+        } else {
+            0.0
+        };
+        vec3(r, g, b)
+    };
+
+    // Highlight-safe WB then rgb_cam → linear sRGB
+    let cam = wb_with_highlight_recovery(rgb, p);
+    let r = cam.x;
+    let g = cam.y;
+    let b = cam.z;
+
+    let lr = f32_max(p.m00 * r + p.m01 * g + p.m02 * b, 0.0);
+    let lg = f32_max(p.m10 * r + p.m11 * g + p.m12 * b, 0.0);
+    let lb = f32_max(p.m20 * r + p.m21 * g + p.m22 * b, 0.0);
+
+    *output = vec4(lr, lg, lb, 1.0);
 }

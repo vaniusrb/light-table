@@ -84,8 +84,11 @@ cargo run --release --no-default-features
 Opening a RAW does **not** block on full demosaic:
 
 1. **Embedded JPEG** preview (near-instant)
-2. **Half-size demosaic** (8-bit LibRaw) for interactive develop
-3. **Full-res** demosaic only on **export** (when needed)
+2. **Quarter proxy** on huge sensors (cheap half-Bayer + 2× box) — faster first GPU view
+3. **Develop proxy** — **Bayer:** unpack mosaic → **GPU demosaic** (full bilinear when long edge ≤ ~3200, else half 2×2) + camera matrix (Phase 4b/4c); non-Bayer (e.g. X-Trans) → LibRaw linear XYZ (Phase 4a)
+4. **Full-res** LibRaw demosaic only on **export** (when needed)
+
+Huge JPEGs are similarly capped for the GPU working texture; export re-reads the file.
 
 ---
 
@@ -194,6 +197,7 @@ Hot path: tiny uniform buffer (+ optional histogram readback). No full-frame CPU
 | `src/gpu/` | wgpu device, pipelines, texture upload (Rust) |
 | `src/develop.rs` | Develop + GPU uniform layout, content viewport |
 | `src/crop.rs` | Non-destructive crop / rotate / flip, export rasterize |
+| `src/color.rs` | Working-space policy (linear sRGB), IEC transfer helpers |
 | `src/image_io.rs` | JPEG/PNG + progressive RAW (CPU cold path) |
 | `src/ui.rs` | egui panels, histogram draw, crop overlay |
 | `shader/src/lib.rs` | **All GPU kernels in Rust:** `vs_present`, `fs_present`, `hist_cs` |
@@ -230,12 +234,12 @@ These are intentional simplifications of the imaging model, not temporary UI gap
 
 | Area | Current behavior | Limitation |
 |---|---|---|
-| **Color management** | Work in linear RGB; display/export via approximate **sRGB** | No ICC profiles, no Display P3 / Adobe RGB, no calibrated monitor path |
-| **RAW decode** | LibRaw process → treat RGB as **sRGB-ish** then convert to linear | Mostly **our** thin use of LibRaw (not a hard LibRaw ceiling). Plan to improve: [`docs/RAW_LINEAR_PIPELINE_PLAN.md`](docs/RAW_LINEAR_PIPELINE_PLAN.md) |
+| **Color management** | **Working space = linear sRGB primaries** ([`src/color.rs`](src/color.rs)); display/export = IEC sRGB OETF | No ICC, no Display P3 / Adobe RGB, no soft-proof; Phase 2B wider space not done |
+| **RAW decode** | **Bayer:** mosaic → GPU demosaic (full bilinear or half 2×2) + `rgb_cam` (4b/4c); **else / export:** LibRaw linear XYZ → app matrix (4a); thumbs = display sRGB → linear | Not Adobe profiles / DCP; export full still LibRaw (not GPU bilinear) — plan: [`docs/RAW_LINEAR_PIPELINE_PLAN.md`](docs/RAW_LINEAR_PIPELINE_PLAN.md) |
 | **Develop ops** | Parametric exposure, contrast, shadows/highlights, WB gains, vibrance/sat | Simple curves/gains — not Lightroom’s full tone curve, HSL, calibration, or profile-based rendering |
 | **Denoise / sharpen** | 5×5 bilateral NR + unsharp mask in linear light | Local only; no multi-scale NR, no masking maps, no detail vs smoothing split like LR |
 | **Crop / rotate** | Non-destructive UV crop, straighten, 90°, flips | No perspective / keystone, no guided upright, no soft-proof crop for print |
-| **Histogram** | 256² sample grid + tone; bins in display sRGB | Does not fully mirror crop/rotate/spatial filters; not a pixel-perfect full-frame hist |
+| **Histogram** | 256² grid over **crop**, same rotate/flip + tone as canvas; display sRGB bins | Skips denoise/sharpen; not every pixel of the full frame |
 | **Working format** | GPU `Rgba16Float` after open | Good for interactive preview; not a 32-bit or camera-raw working space for print-critical work |
 | **Catalog / library** | Single-image session | No filmstrip database, ratings, sync, or batch |
 

@@ -13,18 +13,22 @@ use winit::{
     window::WindowBuilder,
 };
 
+use crate::color;
 use crate::crop::{CropHit, CropState};
+use crate::demosaic::MosaicBuffer;
 use crate::develop::{build_gpu_params, ContentViewport, DevelopParams, ViewState};
+use crate::orient::ImageOrientation;
 use crate::gpu::{
-    create_dummy_source, create_shader_module, upload_source_texture, GpuContext, GpuImage,
-    HistPipelines, PresentPipelines,
+    create_dummy_source, create_shader_module, demosaic_mosaic_to_source, upload_source_texture,
+    DemosaicPipelines, GpuContext, GpuImage, HistPipelines, PresentPipelines,
 };
-use crate::image_io::{self, DecodeQuality, DecodedImage};
+use crate::image_io::{self, DecodeQuality, DecodedImage, ProgressiveStage};
 use crate::ui::{self, UiActions};
 
 /// Messages from the background decode thread (progressive RAW).
 enum LoadMsg {
     Stage(DecodedImage),
+    Mosaic(MosaicBuffer),
     Done,
     Failed(String),
 }
@@ -89,6 +93,7 @@ fn init_logging() {
         .filter_module("wgpu_hal::gles", log::LevelFilter::Off)
         .filter_level(log::LevelFilter::Info)
         .init();
+    log::info!("Color policy: {}", crate::color::policy_summary());
 }
 
 struct App {
@@ -97,6 +102,7 @@ struct App {
 
     present: PresentPipelines,
     hist: HistPipelines,
+    demosaic: DemosaicPipelines,
     sampler: wgpu::Sampler,
     params_buffer: wgpu::Buffer,
     hist_bins_buffer: wgpu::Buffer,
@@ -112,6 +118,8 @@ struct App {
     view: ViewState,
     crop: CropState,
     crop_drag: CropHit,
+    /// Snapshot for histogram invalidation when crop/rotate changes.
+    hist_crop_key: (f32, f32, f32, f32, f32, u32, bool, bool),
     /// Central UI area (normalized later for GPU); excludes toolbar + side panel.
     content_viewport: ContentViewport,
     hist_dirty: bool,
@@ -132,6 +140,10 @@ struct App {
     /// Progressive load channel (thumbnail → half-size).
     load_rx: Option<Receiver<LoadMsg>>,
     loading: bool,
+    /// Auto base EV for current linear RAW (0 for JPEG). Restored on Develop Reset.
+    raw_base_exposure: f32,
+    /// Camera orientation applied to the crop (so export can undo it when LibRaw bakes flip).
+    file_orientation: ImageOrientation,
 }
 
 impl App {
@@ -140,6 +152,7 @@ impl App {
         let shader = create_shader_module(&gpu.device);
         let present = PresentPipelines::new(&gpu.device, &shader, gpu.config.format);
         let hist = HistPipelines::new(&gpu.device, &shader);
+        let demosaic = DemosaicPipelines::new(&gpu.device, &shader);
 
         let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("image sampler"),
@@ -220,6 +233,7 @@ impl App {
             gpu,
             present,
             hist,
+            demosaic,
             sampler,
             params_buffer,
             hist_bins_buffer,
@@ -233,6 +247,7 @@ impl App {
             view,
             crop,
             crop_drag: CropHit::None,
+            hist_crop_key: (0.0, 0.0, 1.0, 1.0, 0.0, 0, false, false),
             content_viewport,
             hist_dirty: true,
             histogram: [0; 1024],
@@ -246,6 +261,8 @@ impl App {
             open_path: None,
             load_rx: None,
             loading: false,
+            raw_base_exposure: 0.0,
+            file_orientation: ImageOrientation::identity(),
         }
     }
 
@@ -393,6 +410,8 @@ impl App {
         self.set_status(format!("Loading {}…", path.display()));
         self.open_path = Some(path.clone());
         self.loading = true;
+        self.file_orientation = ImageOrientation::identity();
+        self.raw_base_exposure = 0.0;
 
         // Raster files: single-shot on a worker so the UI stays responsive
         if !image_io::is_raw_path(&path) {
@@ -412,12 +431,17 @@ impl App {
             return;
         }
 
-        // RAW: progressive thumbnail → half-size demosaic (background thread)
+        // RAW: progressive thumbnail → mosaic/LibRaw half (background thread)
         let (tx, rx) = mpsc::channel();
         self.load_rx = Some(rx);
         std::thread::spawn(move || {
-            let send = |img: DecodedImage| {
-                let _ = tx.send(LoadMsg::Stage(img));
+            let send = |stage: ProgressiveStage| match stage {
+                ProgressiveStage::Image(img) => {
+                    let _ = tx.send(LoadMsg::Stage(img));
+                }
+                ProgressiveStage::Mosaic(m) => {
+                    let _ = tx.send(LoadMsg::Mosaic(m));
+                }
             };
             match image_io::load_raw_progressive(&path, send) {
                 Ok(()) => {
@@ -438,12 +462,21 @@ impl App {
 
         // Drain all ready messages so we jump to the latest stage this frame
         let mut latest: Option<DecodedImage> = None;
+        let mut latest_mosaic: Option<MosaicBuffer> = None;
         let mut done = false;
         let mut failed: Option<String> = None;
 
         loop {
             match rx.try_recv() {
-                Ok(LoadMsg::Stage(img)) => latest = Some(img),
+                Ok(LoadMsg::Stage(img)) => {
+                    latest = Some(img);
+                    // A later raster stage supersedes a pending mosaic only if we
+                    // get mosaic after — mosaic is the final develop proxy when present.
+                }
+                Ok(LoadMsg::Mosaic(m)) => {
+                    latest_mosaic = Some(m);
+                    latest = None; // mosaic is the higher-quality develop stage
+                }
                 Ok(LoadMsg::Done) => done = true,
                 Ok(LoadMsg::Failed(e)) => failed = Some(e),
                 Err(TryRecvError::Empty) => break,
@@ -454,7 +487,10 @@ impl App {
             }
         }
 
-        if let Some(img) = latest {
+        if let Some(mosaic) = latest_mosaic {
+            let first = !self.has_image;
+            self.apply_mosaic(mosaic, first);
+        } else if let Some(img) = latest {
             let first = !self.has_image;
             self.apply_decoded(img, first);
         }
@@ -478,21 +514,50 @@ impl App {
         }
     }
 
-    fn apply_decoded(&mut self, decoded: DecodedImage, reset_view: bool) {
-        let quality = decoded.quality;
-        let label = decoded.label.clone();
+    /// Phase 4b/4c: GPU Bayer demosaic from mosaic (full bilinear when it fits).
+    fn apply_mosaic(&mut self, mosaic: MosaicBuffer, reset_view: bool) {
+        let label = mosaic.label.clone();
+        let mode = mosaic.select_mode(image_io::MAX_GPU_PROXY_EDGE);
+        // Host pixels for export proxy (CPU twin of GPU demosaic)
+        let decoded = image_io::mosaic_to_decoded(&mosaic, mode);
         let dims = (decoded.width, decoded.height);
+        let quality = decoded.quality;
+        let color_label = decoded.color.working_space.label();
+        let enc_label = decoded.color.source_encoding.label();
 
-        let gpu_img = upload_source_texture(&self.gpu.device, &self.gpu.queue, &decoded);
+        let gpu_img = demosaic_mosaic_to_source(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &self.demosaic,
+            &mosaic,
+            mode,
+        );
+
+        // If GPU out size exceeds edge budget, fall back to CPU-limited upload
+        let gpu_img = if gpu_img.width.max(gpu_img.height) > image_io::MAX_GPU_PROXY_EDGE {
+            log::info!(
+                "GPU demosaic {}×{} exceeds edge budget — using CPU-limited proxy",
+                gpu_img.width,
+                gpu_img.height
+            );
+            upload_source_texture(&self.gpu.device, &self.gpu.queue, &decoded)
+        } else {
+            gpu_img
+        };
+
         self.source = gpu_img;
         self.has_image = true;
         if reset_view {
             self.view.fit();
             self.develop.reset();
-            self.prev_develop = self.develop.clone();
             self.crop = CropState::default();
             self.crop_drag = CropHit::None;
         }
+        // Sensor-native mosaic is landscape; apply camera orientation on the canvas.
+        self.apply_file_orientation(mosaic.orientation, reset_view);
+        // Linear RAW is dark without LibRaw auto-bright — set Exposure from the image.
+        self.apply_raw_base_exposure(&decoded);
+        self.prev_develop = self.develop.clone();
         self.hist_dirty = true;
 
         self.present_bind_group = make_present_bg(
@@ -511,18 +576,143 @@ impl App {
             &self.hist_bins_buffer,
         );
 
+        let ev = self.develop.exposure;
+        let orient = mosaic.orientation;
         self.export_pixels = Some(decoded);
         self.set_status(format!(
-            "{} {}×{} ({})",
+            "Develop proxy {}×{} · {} ({}, {}) · base {ev:+.2} EV · orient {} · {}",
+            dims.0,
+            dims.1,
+            color_label,
+            enc_label,
+            mode.label(),
+            orient.label(),
+            label
+        ));
+        log::info!(
+            "Image ready (GPU demosaic {}): {}×{} quality={:?} working={} via {} base_ev={:+.2} orient={}",
+            mode.label(),
+            self.source.width,
+            self.source.height,
+            quality,
+            color_label,
+            enc_label,
+            ev,
+            orient.label()
+        );
+    }
+
+    fn apply_decoded(&mut self, decoded: DecodedImage, reset_view: bool) {
+        let quality = decoded.quality;
+        let label = decoded.label.clone();
+        let dims = (decoded.width, decoded.height);
+        let file_orient = decoded.orientation;
+
+        let gpu_img = upload_source_texture(&self.gpu.device, &self.gpu.queue, &decoded);
+        self.source = gpu_img;
+        self.has_image = true;
+        if reset_view {
+            self.view.fit();
+            self.develop.reset();
+            self.crop = CropState::default();
+            self.crop_drag = CropHit::None;
+        }
+        // Only when pixels are still sensor-native (mosaic path tags orientation).
+        self.apply_file_orientation(file_orient, reset_view);
+        // Thumbnails are already display-bright; develop-quality RAW gets base EV.
+        if quality != DecodeQuality::Thumbnail {
+            self.apply_raw_base_exposure(&decoded);
+        }
+        self.prev_develop = self.develop.clone();
+        self.hist_dirty = true;
+
+        self.present_bind_group = make_present_bg(
+            &self.gpu.device,
+            &self.present.bgl,
+            &self.source.view,
+            &self.sampler,
+            &self.params_buffer,
+        );
+        self.hist_bind_group = make_hist_bg(
+            &self.gpu.device,
+            &self.hist.bgl,
+            &self.source.view,
+            &self.sampler,
+            &self.params_buffer,
+            &self.hist_bins_buffer,
+        );
+
+        let color_label = decoded.color.working_space.label();
+        let enc_label = decoded.color.source_encoding.label();
+        let ev_note = if color::needs_raw_base_exposure(decoded.color.source_encoding)
+            && quality != DecodeQuality::Thumbnail
+        {
+            format!(" · base {:+.2} EV", self.develop.exposure)
+        } else {
+            String::new()
+        };
+        self.export_pixels = Some(decoded);
+        self.set_status(format!(
+            "{} {}×{} · {} ({}){} · {}",
             match quality {
                 DecodeQuality::Thumbnail => "Preview",
+                DecodeQuality::Quarter => "Quarter proxy",
                 DecodeQuality::HalfSize => "Develop proxy",
                 DecodeQuality::Full => "Opened",
             },
             dims.0,
             dims.1,
+            color_label,
+            enc_label,
+            ev_note,
             label
         ));
+        log::info!(
+            "Image ready: {}×{} quality={:?} working={} via {} base_ev={:+.2}",
+            dims.0,
+            dims.1,
+            quality,
+            color_label,
+            enc_label,
+            self.develop.exposure
+        );
+    }
+
+    /// Auto base exposure for linear RAW (replaces LibRaw auto-bright visually).
+    /// Leaves JPEG / display-referred thumbs alone. Shown on the Exposure slider.
+    fn apply_raw_base_exposure(&mut self, decoded: &DecodedImage) {
+        if !color::needs_raw_base_exposure(decoded.color.source_encoding) {
+            self.raw_base_exposure = 0.0;
+            return;
+        }
+        let ev = color::estimate_raw_base_exposure_ev(
+            &decoded.rgba_f32,
+            decoded.width,
+            decoded.height,
+        );
+        self.raw_base_exposure = ev;
+        self.develop.exposure = ev;
+        log::info!(
+            "RAW base exposure {ev:+.2} EV (99th-pct → ~0.78 linear; no LibRaw auto-bright)"
+        );
+    }
+
+    /// Apply camera / EXIF orientation to the crop transform.
+    ///
+    /// Mosaic stages carry LibRaw flip (sensor is landscape). Always re-apply when
+    /// non-identity so progressive open after a thumbnail becomes portrait correctly.
+    fn apply_file_orientation(&mut self, orient: ImageOrientation, reset_view: bool) {
+        let _ = reset_view;
+        if orient.is_identity() {
+            // Don't clear file_orientation if a later identity stage (e.g. LibRaw
+            // process) replaces a mosaic — only set identity when open resets crop.
+            return;
+        }
+        self.file_orientation = orient;
+        orient.apply_to_crop(&mut self.crop);
+        // Display aspect may have swapped (portrait); re-fit letterbox.
+        self.view.fit();
+        log::info!("Applied file orientation: {}", orient.label());
     }
 
     fn set_status(&mut self, msg: impl Into<String>) {
@@ -544,12 +734,16 @@ impl App {
             // Prefer full-res re-decode from original RAW path when we only have a proxy
             let quality = self.export_pixels.as_ref().map(|d| d.quality);
             let src_path = self.open_path.clone();
+            let mut used_libraw_full = false;
             let decoded = match (quality, src_path) {
                 (Some(DecodeQuality::Full), _) | (None, None) => self.export_pixels.clone(),
                 (_, Some(src)) if image_io::is_raw_path(&src) => {
                     self.set_status("Exporting full-res RAW (this may take a while)…");
                     match image_io::load_raw_full(&src) {
-                        Ok(full) => Some(full),
+                        Ok(full) => {
+                            used_libraw_full = true;
+                            Some(full)
+                        }
                         Err(e) => {
                             self.set_status(format!("Full-res decode failed, using proxy: {e}"));
                             self.export_pixels.clone()
@@ -565,18 +759,30 @@ impl App {
             };
 
             let developed = apply_develop_cpu(&decoded, &self.develop);
+            // Crop rect is in *display* UV (after camera orient).
+            // - Mosaic/proxy pixels: sensor-native → keep full crop orient.
+            // - LibRaw full-res: flip already baked into pixels → export only *extra*
+            //   user rotation beyond the file orientation.
+            let mut crop_export = self.crop.clone();
+            if used_libraw_full {
+                let fo = self.file_orientation;
+                crop_export.orient_90 =
+                    (self.crop.orient_90 + 4 - (fo.orient_90 % 4)) % 4;
+                crop_export.flip_h = self.crop.flip_h != fo.flip_h;
+                crop_export.flip_v = self.crop.flip_v != fo.flip_v;
+            }
             // Non-destructive crop + rotate at export
-            let needs_geom = !self.crop.rect.is_full_frame()
-                || self.crop.angle_deg.abs() > 1e-3
-                || self.crop.orient_90 % 4 != 0
-                || self.crop.flip_h
-                || self.crop.flip_v;
+            let needs_geom = !crop_export.rect.is_full_frame()
+                || crop_export.angle_deg.abs() > 1e-3
+                || crop_export.orient_90 % 4 != 0
+                || crop_export.flip_h
+                || crop_export.flip_v;
             let (ew, eh, cropped) = if needs_geom {
                 crate::crop::render_crop_rotate(
                     &developed,
                     decoded.width,
                     decoded.height,
-                    &self.crop,
+                    &crop_export,
                 )
             } else {
                 (decoded.width, decoded.height, developed)
@@ -684,6 +890,21 @@ impl App {
             self.hist_dirty = true;
             self.prev_develop = self.develop.clone();
         }
+        // Histogram samples crop + orient; refresh when geometry changes
+        let crop_key = (
+            self.crop.rect.left,
+            self.crop.rect.top,
+            self.crop.rect.right,
+            self.crop.rect.bottom,
+            self.crop.angle_deg,
+            self.crop.orient_90,
+            self.crop.flip_h,
+            self.crop.flip_v,
+        );
+        if crop_key != self.hist_crop_key {
+            self.hist_crop_key = crop_key;
+            self.hist_dirty = true;
+        }
 
         self.upload_params();
         if self.hist_dirty {
@@ -749,6 +970,10 @@ impl App {
         }
         if actions.reset {
             self.develop.reset();
+            // Keep the RAW base EV that replaced LibRaw auto-bright (not pure 0 EV)
+            if self.raw_base_exposure.abs() > 1e-4 {
+                self.develop.exposure = self.raw_base_exposure;
+            }
             self.hist_dirty = true;
         }
         if actions.fit {

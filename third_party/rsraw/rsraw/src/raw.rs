@@ -14,6 +14,58 @@ pub type BitDepth = u32;
 pub const BIT_DEPTH_8: BitDepth = 8;
 pub const BIT_DEPTH_16: BitDepth = 16;
 
+/// LibRaw `params.output_color` (`-o` flag).
+#[repr(i32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OutputColor {
+    /// Camera raw RGB (unique per camera)
+    Raw = 0,
+    /// sRGB D65 (default in LibRaw)
+    Srgb = 1,
+    Adobe = 2,
+    WideGamut = 3,
+    ProPhoto = 4,
+    Xyz = 5,
+    Aces = 6,
+}
+
+/// Sensor / color metadata from LibRaw (for linear pipelines & GPU demosaic).
+#[derive(Clone, Debug)]
+pub struct SensorMeta {
+    pub black: u32,
+    pub data_maximum: u32,
+    pub maximum: u32,
+    /// Camera white-balance multipliers [R,G,B,G2].
+    pub cam_mul: [f32; 4],
+    pub pre_mul: [f32; 4],
+    /// Camera RGB → reference RGB matrix (3×3, rows).
+    pub rgb_cam: [[f32; 3]; 3],
+    /// CFA filter pattern bitfield (`idata.filters`).
+    /// Bayer: non-zero and not `!0`. X-Trans uses `0` with a separate 6×6 table.
+    pub filters: u32,
+    pub colors: i32,
+    pub raw_width: u32,
+    pub raw_height: u32,
+    /// Visible / active area (after margins).
+    pub width: u32,
+    pub height: u32,
+    pub left_margin: u32,
+    pub top_margin: u32,
+    /// Bytes per raw row (`sizes.raw_pitch`).
+    pub raw_pitch: u32,
+    /// True if `rawdata.raw_image` is non-null after unpack (mosaic buffer present).
+    pub has_raw_image: bool,
+    /// LibRaw / dcraw orientation (`sizes.flip`: 0 none, 3=180, 5=90CCW, 6=90CW).
+    pub flip: i32,
+}
+
+impl SensorMeta {
+    /// Standard Bayer CFA (not X-Trans / monochrome / unknown).
+    pub fn is_bayer(&self) -> bool {
+        self.filters != 0 && self.filters != !0 && self.colors == 3
+    }
+}
+
 pub struct RawImage {
     raw_data: *mut sys::libraw_data_t,
 }
@@ -205,8 +257,119 @@ impl RawImage {
     /// On by default, call if you want to force use of DNG embedded matrix.
     pub fn set_use_camera_matrix(&mut self, enable: bool) {
         unsafe {
+            // LibRaw: 0 = off, 3 = force use when available (historical rsraw default)
             (*self.raw_data).params.use_camera_matrix = if enable { 3 } else { 0 };
         }
+    }
+
+    /// Output colorspace for `dcraw_process` / `process` (`params.output_color`, LibRaw `-o`).
+    ///
+    /// Common values: 0 raw, **1 sRGB**, 2 Adobe, 3 Wide, 4 ProPhoto, 5 XYZ, 6 ACES.
+    pub fn set_output_color(&mut self, space: OutputColor) {
+        unsafe {
+            (*self.raw_data).params.output_color = space as i32;
+        }
+    }
+
+    /// Gamma curve power (`gamm[0]`) and toe slope (`gamm[1]`).
+    /// For **linear** RGB samples use `(1.0, 1.0)`.
+    pub fn set_gamma(&mut self, power: f32, toe_slope: f32) {
+        unsafe {
+            // Prefer C API when available
+            sys::libraw_set_gamma(self.raw_data, 0, power);
+            sys::libraw_set_gamma(self.raw_data, 1, toe_slope);
+        }
+    }
+
+    /// Disable LibRaw auto-brightness stretch (`params.no_auto_bright`).
+    pub fn set_no_auto_bright(&mut self, enable: bool) {
+        unsafe {
+            sys::libraw_set_no_auto_bright(self.raw_data, if enable { 1 } else { 0 });
+        }
+    }
+
+    /// Highlight recovery mode (`params.highlight` / LibRaw `-H`).
+    /// 0 = clip, 1 = unclip, 2 = blend, 3–9 = rebuild. Helps avoid magenta whites.
+    pub fn set_highlight(&mut self, mode: i32) {
+        unsafe {
+            sys::libraw_set_highlight(self.raw_data, mode);
+        }
+    }
+
+    /// Sensor / color metadata after `open` (richer after `unpack`).
+    pub fn sensor_meta(&self) -> SensorMeta {
+        let d = self.as_ref();
+        let c = &d.color;
+        SensorMeta {
+            black: c.black,
+            data_maximum: c.data_maximum,
+            maximum: c.maximum,
+            cam_mul: c.cam_mul,
+            pre_mul: c.pre_mul,
+            // rgb_cam: camera → sRGB-ish matrix used by LibRaw (3×4, first 3 cols)
+            rgb_cam: [
+                [c.rgb_cam[0][0], c.rgb_cam[0][1], c.rgb_cam[0][2]],
+                [c.rgb_cam[1][0], c.rgb_cam[1][1], c.rgb_cam[1][2]],
+                [c.rgb_cam[2][0], c.rgb_cam[2][1], c.rgb_cam[2][2]],
+            ],
+            filters: d.idata.filters,
+            colors: d.idata.colors,
+            raw_width: d.sizes.raw_width as u32,
+            raw_height: d.sizes.raw_height as u32,
+            width: d.sizes.width as u32,
+            height: d.sizes.height as u32,
+            left_margin: d.sizes.left_margin as u32,
+            top_margin: d.sizes.top_margin as u32,
+            raw_pitch: d.sizes.raw_pitch as u32,
+            has_raw_image: !d.rawdata.raw_image.is_null(),
+            flip: d.sizes.flip,
+        }
+    }
+
+    /// Copy the **active-area** mosaic (`width`×`height`) as tightly packed `u16` samples.
+    ///
+    /// Requires [`unpack`](Self::unpack) first. Pitch may exceed `raw_width`; margins are
+    /// applied so the returned buffer is contiguous row-major for the visible CFA.
+    pub fn copy_mosaic_u16(&self) -> Result<Vec<u16>> {
+        let meta = self.sensor_meta();
+        if !meta.has_raw_image {
+            return Err(Error::Data);
+        }
+        let w = meta.width as usize;
+        let h = meta.height as usize;
+        if w == 0 || h == 0 {
+            return Err(Error::Data);
+        }
+
+        let d = self.as_ref();
+        let ptr = d.rawdata.raw_image;
+        if ptr.is_null() {
+            return Err(Error::Data);
+        }
+
+        let pitch_samples = if meta.raw_pitch >= 2 {
+            (meta.raw_pitch / 2) as usize
+        } else {
+            meta.raw_width as usize
+        };
+        let left = meta.left_margin as usize;
+        let top = meta.top_margin as usize;
+        let raw_w = meta.raw_width as usize;
+        let raw_h = meta.raw_height as usize;
+
+        if left + w > raw_w || top + h > raw_h {
+            return Err(Error::BadCrop);
+        }
+
+        let mut out = Vec::with_capacity(w * h);
+        unsafe {
+            for row in 0..h {
+                let src_row = ptr.add((top + row) * pitch_samples + left);
+                let slice = std::slice::from_raw_parts(src_row, w);
+                out.extend_from_slice(slice);
+            }
+        }
+        Ok(out)
     }
 
     pub fn process<const D: BitDepth>(&mut self) -> Result<ProcessedImage<D>> {
